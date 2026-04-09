@@ -617,10 +617,360 @@ registerProcessor('pcm-player', PCMProcessor);
    is held until the map entry appears (or a MAX_FRAME_WAIT_S deadline).
    ═══════════════════════════════════════════════════════════ */
 
-const SAMPLE_RATE    = 24000;   // must match Moshi's mimi.sample_rate
-const VIDEO_LEAD_S   = 0.0;     // seconds: positive = video leads audio
-const MAX_FRAME_WAIT_S = 3.0;   // drop frame if audio map never arrives
-const MAX_FRAME_QUEUE  = 60;    // drop old frames if queue grows too large
+const SAMPLE_RATE   = 24000;   // must match Moshi mimi.sample_rate
+const MAX_FRAME_QUEUE = 30;    // max decoded frames allowed in pending queue before dropping
+
+/* ── State ─────────────────────────────────────────────── */
+let ws = null, sessionId = null;
+let mediaRecorder = null;
+let audioCtx = null, pcmNode = null, analyserNode = null;
+let volRafId = null;
+let isConnected = false, isRecording = false;
+let connectStartMs = 0;
+
+// Decoded frames ready to draw — simple array, oldest first.
+// Each entry is an ImageBitmap (already GPU-uploaded).
+const pendingFrames = [];
+
+let renderRafId = null;
+let framesRecv = 0, audioPackets = 0, firstFrameMs = null;
+let fpsCount = 0, fpsDrawn = 0, fpsLast = performance.now();
+
+/* ── DOM ───────────────────────────────────────────────── */
+const canvas       = document.getElementById('video-canvas');
+const ctx2d        = canvas.getContext('2d');
+const $status      = document.getElementById('status-pill');
+const $statusTxt   = document.getElementById('status-text');
+const $btnConnect  = document.getElementById('btn-connect');
+const $btnMic      = document.getElementById('btn-mic');
+const $connectLbl  = document.getElementById('connect-label');
+const $micLbl      = document.getElementById('mic-label');
+const $volBar      = document.getElementById('vol-bar');
+const $transcript  = document.getElementById('transcript');
+const $idleOverlay = document.getElementById('idle-overlay');
+const $liveBadge   = document.getElementById('live-badge');
+const $audioBadge  = document.getElementById('audio-indicator');
+const $fpsBadge    = document.getElementById('fps-badge');
+const $toast       = document.getElementById('toast');
+const $uploadZone  = document.getElementById('upload-zone');
+const $fileInput   = document.getElementById('file-input');
+const $preview     = document.getElementById('portrait-preview');
+const $placeholder = document.getElementById('upload-placeholder');
+const $statFrames  = document.getElementById('stat-frames');
+const $statFps     = document.getElementById('stat-fps');
+const $statAudio   = document.getElementById('stat-audio');
+const $statLatency = document.getElementById('stat-latency');
+const $syncDot     = document.getElementById('sync-dot');
+const $syncLabel   = document.getElementById('sync-label');
+
+/* ── Toast ─────────────────────────────────────────────── */
+let _toastT;
+function toast(msg, type = '') {
+  $toast.textContent = msg;
+  $toast.className = 'toast show ' + type;
+  clearTimeout(_toastT);
+  _toastT = setTimeout(() => { $toast.className = 'toast'; }, 3500);
+}
+
+/* ── Status ────────────────────────────────────────────── */
+function setStatus(label, cls = '') {
+  $statusTxt.textContent = label;
+  $status.className = 'status-pill ' + cls;
+}
+
+/* ── Upload ────────────────────────────────────────────── */
+$uploadZone.addEventListener('click', () => $fileInput.click());
+$uploadZone.addEventListener('dragover', e => { e.preventDefault(); $uploadZone.classList.add('drag-over'); });
+$uploadZone.addEventListener('dragleave', () => $uploadZone.classList.remove('drag-over'));
+$uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); $uploadZone.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) doUpload(e.dataTransfer.files[0]);
+});
+$fileInput.addEventListener('change', () => { if ($fileInput.files[0]) doUpload($fileInput.files[0]); });
+
+async function doUpload(file) {
+  const url = URL.createObjectURL(file);
+  $preview.src = url; $preview.style.display = 'block';
+  $placeholder.style.display = 'none';
+  setStatus('Uploading…', 'connecting');
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch('/upload_image', { method: 'POST', body: form });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    sessionId = data.session_id;
+    toast(`Portrait ready  (session ${sessionId})`, 'success');
+    setStatus('Image ready — click Connect', '');
+    $btnConnect.disabled = false;
+  } catch (e) {
+    toast('Upload failed: ' + e.message, 'error');
+    setStatus('Upload error', 'error');
+  }
+}
+
+/* ── AudioWorklet bootstrap ─────────────────────────────── */
+async function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  const src     = document.getElementById('pcm-processor-src').textContent;
+  const blob    = new Blob([src], { type: 'application/javascript' });
+  const blobUrl = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(blobUrl);
+  URL.revokeObjectURL(blobUrl);
+  pcmNode = new AudioWorkletNode(audioCtx, 'pcm-player', {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+  });
+  pcmNode.connect(audioCtx.destination);
+}
+
+/* ── Schedule raw float32 PCM ───────────────────────────── */
+function scheduleRawPCM(arrayBuffer) {
+  if (!audioCtx || !pcmNode) return;
+  const floats = new Float32Array(arrayBuffer);
+  pcmNode.port.postMessage(floats, [floats.buffer]);
+  // Show audio indicator briefly
+  $audioBadge.classList.add('visible');
+  clearTimeout(scheduleRawPCM._t);
+  scheduleRawPCM._t = setTimeout(() => $audioBadge.classList.remove('visible'), 800);
+}
+
+/* ── Connect / Disconnect ───────────────────────────────── */
+$btnConnect.addEventListener('click', () => {
+  if (isConnected) disconnect(); else connect();
+});
+
+async function connect() {
+  if (!sessionId) { toast('Upload a portrait first', 'error'); return; }
+  await initAudio();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/${sessionId}`);
+  ws.binaryType = 'arraybuffer';
+  setStatus('Connecting…', 'connecting');
+  connectStartMs = performance.now();
+
+  ws.onopen = () => {
+    isConnected = true;
+    setStatus('Connected', 'connected');
+    $connectLbl.textContent = 'Disconnect';
+    $btnConnect.classList.add('disconnecting');
+    $btnMic.disabled = false;
+    toast('Connected to server', 'success');
+    startRenderLoop();
+  };
+
+  ws.onmessage = (ev) => {
+    const buf  = ev.data;
+    const kind = new Uint8Array(buf, 0, 1)[0];
+
+    if (kind === 0x00) {
+      // Handshake
+
+    } else if (kind === 0x01) {
+      // Audio: 0x01 | seq(4) | float32 PCM
+      // seq bytes (1–4) are present for wire compatibility but not used for sync
+      if (buf.byteLength < 6) return;
+      audioPackets++;
+      $statAudio.textContent = audioPackets;
+      scheduleRawPCM(buf.slice(5));  // skip kind(1) + seq(4)
+
+    } else if (kind === 0x02) {
+      // Video: 0x02 | seq(4) | JPEG — decode asynchronously
+      if (buf.byteLength < 6) return;
+      framesRecv++;
+      $statFrames.textContent = framesRecv;
+
+      if (!firstFrameMs) {
+        firstFrameMs = performance.now() - connectStartMs;
+        $statLatency.textContent = Math.round(firstFrameMs) + 'ms';
+        $idleOverlay.classList.add('hidden');
+        $liveBadge.classList.add('visible');
+        $syncDot.className = 'sync-dot synced';
+        $syncLabel.textContent = 'Video streaming ✓';
+      }
+
+      // Decode JPEG → ImageBitmap asynchronously (off main thread via browser)
+      // then push into pendingFrames. Drop oldest if queue is full.
+      const jpegSlice = buf.slice(5);   // skip kind(1) + seq(4)
+      createImageBitmap(new Blob([jpegSlice], { type: 'image/jpeg' }))
+        .then(bmp => {
+          if (!isConnected) { bmp.close(); return; }
+          if (pendingFrames.length >= MAX_FRAME_QUEUE) {
+            // Queue too full (decode faster than render) — drop oldest
+            pendingFrames.shift().close();
+          }
+          pendingFrames.push(bmp);
+        })
+        .catch(() => {});   // ignore rare decode errors
+
+    } else if (kind === 0x03) {
+      appendTranscript(new TextDecoder().decode(buf.slice(1)));
+
+    } else if (kind === 0xFF) {
+      toast('Server: ' + new TextDecoder().decode(buf.slice(1)), 'error');
+      disconnect();
+    }
+  };
+
+  ws.onclose  = () => onDisconnected();
+  ws.onerror  = () => { toast('WebSocket error', 'error'); onDisconnected(); };
+}
+
+function disconnect() {
+  if (ws) { try { ws.close(); } catch(_){} ws = null; }
+  stopRecording();
+  onDisconnected();
+}
+
+function onDisconnected() {
+  isConnected = false;
+  $btnMic.disabled = true;
+  $connectLbl.textContent = 'Connect';
+  $btnConnect.classList.remove('disconnecting');
+  setStatus('Disconnected', '');
+  $liveBadge.classList.remove('visible');
+  $audioBadge.classList.remove('visible');
+  cancelAnimationFrame(renderRafId);
+  // Release pending decoded bitmaps
+  while (pendingFrames.length) pendingFrames.pop().close();
+  if (pcmNode) { pcmNode.port.postMessage('flush'); }
+  $syncDot.className = 'sync-dot';
+  $syncLabel.textContent = 'A/V sync: waiting';
+}
+
+/* ══════════════════════════════════════════════════════════
+   Render Loop — draw pendingFrames as fast as they arrive.
+
+   Each requestAnimationFrame call draws AT MOST one frame
+   (the oldest decoded bitmap in pendingFrames).  This gives
+   smooth playback at whatever rate the server produces frames
+   without any artificial delay.
+
+   FPS is measured as drawn-frames-per-second (not recv rate).
+   ══════════════════════════════════════════════════════════ */
+function startRenderLoop() {
+  fpsLast = performance.now();
+  fpsCount = 0;
+
+  function renderFrame(nowMs) {
+    renderRafId = requestAnimationFrame(renderFrame);
+
+    // Draw the next available frame (if any)
+    if (pendingFrames.length > 0) {
+      const bmp = pendingFrames.shift();
+      ctx2d.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      bmp.close();
+      fpsCount++;
+    }
+
+    // FPS counter — update once per second
+    if (nowMs - fpsLast >= 1000) {
+      const fps = Math.round(fpsCount * 1000 / (nowMs - fpsLast));
+      $fpsBadge.textContent = fps + ' fps';
+      $statFps.textContent  = fps;
+      // Update sync label with queue depth hint
+      const qd = pendingFrames.length;
+      if (qd > 10) {
+        $syncDot.className = 'sync-dot drifting';
+        $syncLabel.textContent = `Frame buffer: ${qd} frames ⚠`;
+      } else if (fps > 0) {
+        $syncDot.className = 'sync-dot synced';
+        $syncLabel.textContent = `${fps} fps · ${qd} buffered`;
+      }
+      fpsCount = 0; fpsLast = nowMs;
+    }
+  }
+
+  renderRafId = requestAnimationFrame(renderFrame);
+}
+
+/* ── Microphone ────────────────────────────────────────── */
+$btnMic.addEventListener('click', () => {
+  if (isRecording) stopRecording(); else startRecording();
+});
+
+async function startRecording() {
+  if (!isConnected) { toast('Connect first', 'error'); return; }
+  if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    isRecording = true;
+    $btnMic.classList.add('recording');
+    $micLbl.textContent = 'Stop Speaking';
+
+    const inputSrc = audioCtx.createMediaStreamSource(stream);
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 256;
+    inputSrc.connect(analyserNode);
+    animateVolume();
+
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus' : 'audio/ogg;codecs=opus';
+    mediaRecorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 });
+
+    mediaRecorder.ondataavailable = async (ev) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN || ev.data.size === 0) return;
+      const ab  = await ev.data.arrayBuffer();
+      const msg = new Uint8Array(1 + ab.byteLength);
+      msg[0] = 0x01;
+      msg.set(new Uint8Array(ab), 1);
+      ws.send(msg.buffer);
+    };
+
+    mediaRecorder.start(80);
+    toast('Microphone active — speak now!', 'success');
+  } catch(e) {
+    toast('Mic error: ' + e.message, 'error');
+    isRecording = false;
+    $btnMic.classList.remove('recording');
+    $micLbl.textContent = 'Start Speaking';
+  }
+}
+
+function stopRecording() {
+  isRecording = false;
+  $btnMic.classList.remove('recording');
+  $micLbl.textContent = 'Start Speaking';
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
+    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+  }
+  mediaRecorder = null;
+  cancelAnimationFrame(volRafId);
+  $volBar.style.width = '0%';
+  analyserNode = null;
+}
+
+function animateVolume() {
+  const data = new Uint8Array(analyserNode.frequencyBinCount);
+  const tick = () => {
+    if (!analyserNode) return;
+    analyserNode.getByteFrequencyData(data);
+    const avg = data.reduce((s,v) => s + v, 0) / data.length;
+    $volBar.style.width = Math.min(avg * 2.2, 100) + '%';
+    volRafId = requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+/* ── Transcript ────────────────────────────────────────── */
+function appendTranscript(text) {
+  const s = document.createElement('span');
+  s.className = 'word-new';
+  s.textContent = text;
+  $transcript.appendChild(s);
+  $transcript.scrollTop = $transcript.scrollHeight;
+  setTimeout(() => s.classList.remove('word-new'), 500);
+}
+document.getElementById('btn-clear').addEventListener('click', () => { $transcript.innerHTML = ''; });
+</script>
+</body>
+</html>
+
 
 /* ── State ─────────────────────────────────────────────── */
 let ws = null, sessionId = null;

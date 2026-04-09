@@ -302,13 +302,19 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     )
 
     # ── Queues ────────────────────────────────────────────────────────────────
-    # token_queue: Moshi → Bridge  (contains TaggedToken or None sentinel)
+    # token_queue: Moshi → Bridge  (TaggedToken items or None sentinel)
     token_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
 
-    # frame_queue: Ditto → WebSocket sender (contains (seq, jpeg) or None)
-    # This queue lives entirely in the asyncio world; we use
-    # run_coroutine_threadsafe() to push into it from the frame_reader thread.
-    frame_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    # frame_queue: Ditto thread → frame_forwarder (JPEG bytes or None sentinel)
+    # Populated via loop.call_soon_threadsafe so it is always touched from the
+    # event-loop thread — no run_coroutine_threadsafe futures needed.
+    frame_queue: asyncio.Queue = asyncio.Queue(maxsize=300)
+
+    # send_queue: the ONE queue that the ws_sender_task drains.
+    # ALL outbound WebSocket messages go here (audio, video, text, handshake).
+    # This guarantees only one coroutine ever calls websocket.send_bytes(),
+    # eliminating the concurrent-drain AssertionError crash.
+    send_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
     # Shared error signal: any task can set this to trigger coordinated shutdown
     error_event: asyncio.Event = asyncio.Event()
@@ -321,6 +327,37 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         except (WebSocketDisconnect, Exception):
             return None
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ws_sender_task — THE ONLY TASK THAT CALLS websocket.send_bytes()
+    # ══════════════════════════════════════════════════════════════════════════
+    async def ws_sender_task():
+        """
+        Single serialised WebSocket writer.
+
+        All other tasks put bytes into send_queue; this task drains it.
+        This eliminates the concurrent-drain AssertionError caused by
+        audio, video, and text coroutines all calling send_bytes() at once.
+
+        Termination: a None sentinel in send_queue stops this task.
+        """
+        try:
+            while True:
+                msg = await send_queue.get()
+                if msg is None:
+                    break
+                try:
+                    await websocket.send_bytes(msg)
+                except (WebSocketDisconnect, Exception) as exc:
+                    logger.debug(f"[ws_sender] Send failed ({type(exc).__name__}) — stopping")
+                    error_event.set()
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.exception(f"[ws_sender] Unexpected error: {exc}")
+            error_event.set()
+        logger.debug("[ws_sender] Exited.")
+
     # ── Bridge task: token_queue → features → Ditto ──────────────────────────
     async def bridge_task():
         """
@@ -330,25 +367,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         Adaptive batching: flush to Ditto when EITHER:
           (a) token_buffer reaches BRIDGE_CHUNK tokens, OR
           (b) BRIDGE_FLUSH_TIMEOUT_MS has elapsed since the first token arrived.
-        This eliminates the 320ms+ stall during pauses when fewer than
-        BRIDGE_CHUNK tokens have arrived.
+        This eliminates the 320ms+ stall during pauses.
         """
         bridge.reset()
-        token_buffer: list[TaggedToken] = []
+        token_buffer: list = []
         chunk_size    = cfg.BRIDGE_CHUNK
-        flush_timeout = cfg.BRIDGE_FLUSH_TIMEOUT_MS / 1000.0  # seconds
+        flush_timeout = cfg.BRIDGE_FLUSH_TIMEOUT_MS / 1000.0
         first_token_time: Optional[float] = None
-        first_seq_in_batch: int = 0
 
         async def _flush():
-            nonlocal token_buffer, first_token_time, first_seq_in_batch
+            nonlocal token_buffer, first_token_time
             if not token_buffer:
                 return
-            chunk_tensor = torch.cat([t.tensor for t in token_buffer], dim=0)  # (len, dep_q)
+            chunk_tensor = torch.cat([t.tensor for t in token_buffer], dim=0)
             batch_seq    = token_buffer[0].seq
             token_buffer = []
             first_token_time = None
-
             try:
                 features_np = await asyncio.to_thread(
                     _run_bridge_step, bridge, chunk_tensor
@@ -356,7 +390,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 ditto.push_features(features_np, seq=batch_seq)
                 logger.debug(
                     f"[bridge_task] Flushed {chunk_tensor.shape[0]} tokens "
-                    f"(seq={batch_seq}) → {features_np.shape} features"
+                    f"seq={batch_seq} → {features_np.shape}"
                 )
             except Exception as exc:
                 logger.error(f"[bridge_task] Bridge step error: {exc}")
@@ -364,34 +398,24 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
         try:
             while True:
-                # Determine remaining time before a flush is needed
                 if first_token_time is not None:
                     elapsed = time.monotonic() - first_token_time
                     wait_time = max(0.0, flush_timeout - elapsed)
                 else:
-                    wait_time = flush_timeout  # no tokens yet; full window
+                    wait_time = flush_timeout
 
                 try:
-                    item = await asyncio.wait_for(
-                        token_queue.get(), timeout=wait_time
-                    )
+                    item = await asyncio.wait_for(token_queue.get(), timeout=wait_time)
                 except asyncio.TimeoutError:
-                    # Flush timeout expired — send whatever is in the buffer
                     if token_buffer:
-                        logger.debug(
-                            f"[bridge_task] Adaptive flush after {flush_timeout*1000:.0f}ms "
-                            f"({len(token_buffer)} tokens)"
-                        )
                         await _flush()
                     continue
 
                 if item is None:
-                    # Session-end sentinel — flush remaining tokens then exit
                     await _flush()
                     break
 
                 if error_event.is_set():
-                    # Error in another task — drain queue and exit
                     break
 
                 token_buffer.append(item)
@@ -405,140 +429,148 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             logger.exception(f"[bridge_task] Unhandled error: {exc}")
             error_event.set()
         finally:
-            # Signal Ditto that input is done
             ditto.close()
             logger.info("[bridge_task] Done.")
 
-    # ── Frame reader task: Ditto frames → frame_queue ────────────────────────
+    # ── Frame reader task: Ditto thread → frame_queue ────────────────────────
     async def frame_reader_task():
         """
-        Read JPEG frames from Ditto's blocking iter_frames() in a thread.
+        Reads JPEG bytes from Ditto's blocking iter_frames() inside
+        asyncio.to_thread(), then pushes them into frame_queue using
+        loop.call_soon_threadsafe() + put_nowait() — no Future overhead,
+        no blocking the reader thread waiting for the event loop.
 
-        CRITICAL FIX: asyncio.Queue is NOT thread-safe.  We must use
-        asyncio.run_coroutine_threadsafe() to push into it from the thread
-        that runs _blocking_iter, NOT put_nowait() directly.
+        Frames are DROPPED (not blocked) when frame_queue is full.
         """
         loop = asyncio.get_running_loop()
+
+        def _safe_enqueue(item):
+            """Called on the event-loop thread via call_soon_threadsafe."""
+            try:
+                frame_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                if item is not None:
+                    logger.warning("[frame_reader_task] frame_queue full — frame dropped")
+                else:
+                    # Must deliver sentinel even if queue is full; retry once
+                    # by clearing one slot.
+                    try:
+                        frame_queue.get_nowait()   # drop oldest frame
+                    except asyncio.QueueEmpty:
+                        pass
+                    frame_queue.put_nowait(None)
 
         def _blocking_iter():
             for jpeg in ditto.iter_frames():
                 if error_event.is_set():
                     break
-                # Thread-safe push into the asyncio frame_queue
-                future = asyncio.run_coroutine_threadsafe(
-                    frame_queue.put(jpeg), loop
-                )
-                try:
-                    future.result(timeout=2.0)
-                except Exception as e:
-                    logger.warning(f"[frame_reader_task] frame_queue put failed: {e}")
-                    if error_event.is_set():
-                        break
-            # Push sentinel — also thread-safe
-            asyncio.run_coroutine_threadsafe(
-                frame_queue.put(None), loop
-            ).result(timeout=2.0)
+                loop.call_soon_threadsafe(_safe_enqueue, jpeg)
+            # Always deliver sentinel so frame_forwarder_task can exit
+            loop.call_soon_threadsafe(_safe_enqueue, None)
 
         try:
             await asyncio.to_thread(_blocking_iter)
         except Exception as exc:
             logger.exception(f"[frame_reader_task] Error: {exc}")
             error_event.set()
-            try:
-                await frame_queue.put(None)
-            except Exception:
-                pass
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(_safe_enqueue, None)
 
-    # ── Frame sender task: frame_queue → WebSocket ────────────────────────────
-    async def frame_sender_task():
+    # ── Frame forwarder task: frame_queue → send_queue ───────────────────────
+    async def frame_forwarder_task():
         """
-        Send JPEG frames over WebSocket as 0x02 messages.
+        Drains frame_queue and puts JPEG frames into send_queue for the
+        ws_sender_task to transmit.  Separate from the WebSocket write so
+        frame buffering never blocks the sender.
 
-        Wire format: 0x02 | <seq: 4 bytes big-endian> | <jpeg bytes>
-        The 4-byte seq lets the browser align this frame to the audio packet
-        with the same seq number.
+        Wire format: 0x02 | <frame_seq: 4 bytes BE uint32> | <jpeg bytes>
         """
         frame_count = 0
-        seq_counter = 0   # monotonic frame counter for the video stream
-
+        seq_counter = 0
         try:
             while True:
                 jpeg = await frame_queue.get()
-                if jpeg is None:
-                    break
-                if error_event.is_set():
+                if jpeg is None or error_event.is_set():
                     break
                 frame_count += 1
-                # Encode frame seq as big-endian uint32
-                seq_bytes = struct.pack(">I", seq_counter & 0xFFFF_FFFF)
+                hdr = b"\x02" + struct.pack(">I", seq_counter & 0xFFFF_FFFF)
                 seq_counter += 1
+                # put_nowait: if send_queue is full drop frame rather than block
                 try:
-                    await websocket.send_bytes(b"\x02" + seq_bytes + jpeg)
-                except Exception:
-                    error_event.set()
-                    break
+                    send_queue.put_nowait(hdr + jpeg)
+                except asyncio.QueueFull:
+                    logger.warning("[frame_forwarder] send_queue full — frame dropped")
         except Exception as exc:
-            logger.exception(f"[frame_sender_task] Error: {exc}")
+            logger.exception(f"[frame_forwarder_task] Error: {exc}")
             error_event.set()
-        logger.info(f"[frame_sender_task] Done. Sent {frame_count} frames.")
+        logger.info(f"[frame_forwarder_task] Done. Forwarded {frame_count} frames.")
 
     # ── Start background tasks ────────────────────────────────────────────────
-    t_bridge       = asyncio.create_task(bridge_task(),       name="bridge_task")
-    t_frame_reader = asyncio.create_task(frame_reader_task(), name="frame_reader_task")
-    t_frame_sender = asyncio.create_task(frame_sender_task(), name="frame_sender_task")
+    t_ws_sender    = asyncio.create_task(ws_sender_task(),       name="ws_sender")
+    t_bridge       = asyncio.create_task(bridge_task(),          name="bridge_task")
+    t_frame_reader = asyncio.create_task(frame_reader_task(),    name="frame_reader_task")
+    t_frame_fwd    = asyncio.create_task(frame_forwarder_task(), name="frame_forwarder_task")
 
     # ── Moshi main loop (drives audio I/O + token capture) ───────────────────
     try:
         async for kind, payload in moshi.handle_connection(receive_fn, token_queue):
-            # Stop sending if a downstream task failed
             if error_event.is_set():
                 logger.warning("[WS] Error event set — stopping Moshi loop")
                 break
 
             if kind == "handshake":
-                await websocket.send_bytes(b"\x00")
+                await send_queue.put(b"\x00")
 
             elif kind == "audio":
-                # payload is (seq, pcm_bytes) from the updated streaming_moshi
+                # payload = (seq, raw_float32_pcm_bytes)
                 moshi_seq, pcm_bytes = payload
-                seq_bytes = seq_pack(moshi_seq)
-                await websocket.send_bytes(b"\x01" + seq_bytes + pcm_bytes)
+                hdr = b"\x01" + seq_pack(moshi_seq)
+                try:
+                    send_queue.put_nowait(hdr + pcm_bytes)
+                except asyncio.QueueFull:
+                    pass  # drop audio frame rather than block Moshi loop
 
             elif kind == "text":
-                await websocket.send_bytes(b"\x03" + payload.encode("utf-8"))
+                try:
+                    send_queue.put_nowait(b"\x03" + payload.encode("utf-8"))
+                except asyncio.QueueFull:
+                    pass
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected — session {session_id}")
     except RuntimeError as exc:
-        # Moshi busy rejection propagates here
         logger.warning(f"[WS] {exc}")
         try:
-            await websocket.send_bytes(b"\xff" + str(exc).encode())
+            await send_queue.put(b"\xff" + str(exc).encode())
         except Exception:
             pass
     except Exception as exc:
         logger.exception(f"[WS] Unexpected error in session {session_id}: {exc}")
         try:
-            await websocket.send_bytes(b"\xff" + str(exc).encode())
+            await send_queue.put(b"\xff" + str(exc).encode())
         except Exception:
             pass
     finally:
-        # Signal all tasks to stop
         error_event.set()
 
-        # Wait for background tasks with a global timeout to prevent zombie sessions
+        # Stop the ws_sender cleanly by putting the sentinel
+        try:
+            send_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+        # Wait for all tasks to finish (10s hard deadline)
+        all_tasks = (t_ws_sender, t_bridge, t_frame_reader, t_frame_fwd)
         try:
             await asyncio.wait_for(
-                asyncio.gather(t_bridge, t_frame_reader, t_frame_sender,
-                               return_exceptions=True),
+                asyncio.gather(*all_tasks, return_exceptions=True),
                 timeout=10.0,
             )
         except asyncio.TimeoutError:
             logger.warning(f"[WS] Session {session_id} cleanup timed out — cancelling tasks")
-            for t in (t_bridge, t_frame_reader, t_frame_sender):
+            for t in all_tasks:
                 t.cancel()
-            await asyncio.gather(t_bridge, t_frame_reader, t_frame_sender,
-                                 return_exceptions=True)
+            await asyncio.gather(*all_tasks, return_exceptions=True)
 
         try:
             await websocket.close()
