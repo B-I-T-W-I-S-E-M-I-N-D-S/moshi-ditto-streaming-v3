@@ -201,12 +201,15 @@ class DittoStreamAdapter:
             except queue.Empty:
                 break
 
-        # ── Patch writer_worker BEFORE setup() starts threads ──────────────
-        # FIX: Previously the patch was applied after setup(), creating a race
-        # where the original thread and the new thread could both run.
-        self._patch_writer_worker_function()
+        # ── Pre-install the writer patch on the SDK instance ──────────────
+        # We set sdk.writer_worker = our_function BEFORE sdk.setup() so that
+        # when setup() does threading.Thread(target=self.writer_worker) it uses
+        # our version.  Crucially, the patched function accesses sdk.writer_queue
+        # and sdk.stop_event LAZILY (inside the thread body), so they don't need
+        # to exist at patch-install time.
+        self._install_writer_patch()
 
-        # We pass a dummy output path; the writer is patched above
+        # We pass a dummy output path; the writer is monkey-patched above
         _DUMMY_OUT = "/tmp/ditto_stream_dummy.mp4"
 
         self.sdk.setup(
@@ -219,45 +222,59 @@ class DittoStreamAdapter:
             overlap_v2         = overlap_v2,
         )
 
+        # ── Fallback: if the SDK didn't use our patched method (some versions
+        # store the target as a local function reference rather than looking it
+        # up via self.writer_worker), replace the last thread in thread_list.
+        self._ensure_writer_patched()
+
         self._is_setup = True
         logger.info(f"[DittoStreamAdapter] Session ready for image: {image_path}")
 
     # ------------------------------------------------------------------
-    # Monkey-patch the writer function on the SDK class/object
+    # Writer patch installation (BEFORE sdk.setup())
     # ------------------------------------------------------------------
 
-    def _patch_writer_worker_function(self):
+    def _install_writer_patch(self):
         """
-        Replace sdk.writer_worker (the *function* attribute, not a running
-        thread) so that when sdk.setup() starts the writer thread it runs
-        our intercepting version which pushes JPEG frames to self._frame_queue
-        instead of writing to disk.
+        Install our intercepting writer_worker on the SDK instance BEFORE
+        setup() is called, so the SDK starts our thread from the beginning.
 
-        This must be called BEFORE sdk.setup() to avoid any race.
+        KEY FIX: sdk.writer_queue and sdk.stop_event are accessed LAZILY
+        inside the thread body — they don't exist yet at install time, only
+        after sdk.setup() runs.  The thread body runs after setup(), so by
+        then both attributes exist.
         """
-        frame_queue  = self._frame_queue
-        jpeg_encode  = self._jpeg_encode
-        stop_event   = self.sdk.stop_event
+        frame_queue = self._frame_queue
+        jpeg_encode = self._jpeg_encode
+        sdk         = self.sdk  # capture reference; do NOT access .stop_event here
 
         def _patched_writer_worker():
             """
-            Runs inside the Ditto SDK thread pool.
-            Reads from sdk.writer_queue, JPEG-encodes each frame, and
-            puts it into our frame_queue with put_nowait() (drop on full).
+            Runs inside the Ditto SDK thread pool (started by sdk.setup()).
 
-            FIX: Previous code used blocking queue.put() which could stall
-            the entire Ditto pipeline when the browser disconnected.
+            Accesses sdk.writer_queue and sdk.stop_event LAZILY (they are
+            created by sdk.setup() before the thread is actually started,
+            so they exist by the time this function body executes).
+
+            Uses put_nowait() + drop so the Ditto pipeline never blocks
+            waiting for a slow or disconnected browser.
             """
-            writer_queue = self.sdk.writer_queue
+            # --- lazy access: these exist because sdk.setup() already ran ---
+            writer_queue = sdk.writer_queue
+            stop_event   = getattr(sdk, 'stop_event', None)
+
             logger.info("[DittoStreamAdapter] patched writer_worker started")
             try:
-                while not stop_event.is_set():
+                while True:
+                    # Honour stop_event if the SDK has one
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     try:
                         item = writer_queue.get(timeout=1.0)
                     except queue.Empty:
                         continue
                     if item is None:
-                        # SDK signals end-of-stream
+                        # SDK end-of-stream sentinel
                         break
                     rgb = item   # numpy uint8 HWC RGB
                     try:
@@ -267,8 +284,7 @@ class DittoStreamAdapter:
                             f"[DittoStreamAdapter] JPEG encode error: {enc_err}"
                         )
                         continue
-                    # FIX: use put_nowait to never block the Ditto pipeline.
-                    # Drop frames silently when the consumer is too slow.
+                    # Non-blocking: drop frames when the browser is too slow
                     try:
                         frame_queue.put_nowait(jpeg)
                     except queue.Full:
@@ -277,21 +293,85 @@ class DittoStreamAdapter:
                             "dropping frame (browser consumer too slow)"
                         )
             finally:
-                frame_queue.put(_SENTINEL)   # signal end of stream
+                frame_queue.put(_SENTINEL)   # signal iter_frames() to stop
                 logger.info("[DittoStreamAdapter] patched writer_worker exited")
 
-        # Replace the method on the instance — sdk.setup() will call
-        # self.writer_worker() when it starts the writer thread.
-        # Different Ditto SDK versions name this differently; we handle
-        # both by patching the known attribute names.
-        if hasattr(self.sdk, "writer_worker"):
-            self.sdk.writer_worker = _patched_writer_worker
-        # Some versions store it as a bound method reference; replace that too.
-        if hasattr(self.sdk, "_writer_worker"):
-            self.sdk._writer_worker = _patched_writer_worker
+        # Install on all known attribute names the SDK might use
+        _patched = False
+        for attr in ('writer_worker', '_writer_worker'):
+            if hasattr(sdk, attr):
+                setattr(sdk, attr, _patched_writer_worker)
+                logger.debug(f"[DittoStreamAdapter] Patched sdk.{attr} (pre-setup)")
+                _patched = True
 
-        # Store for introspection / debugging
+        # Store reference so _ensure_writer_patched() can use same function
         self._patched_fn = _patched_writer_worker
+        self._pre_patched = _patched
+        logger.debug(
+            f"[DittoStreamAdapter] Writer pre-patch installed "
+            f"(method found: {_patched})"
+        )
+
+    # ------------------------------------------------------------------
+    # Fallback: replace writer thread AFTER setup() if pre-patch missed
+    # ------------------------------------------------------------------
+
+    def _ensure_writer_patched(self):
+        """
+        Called after sdk.setup() to verify our patched writer is running.
+
+        Some Ditto SDK versions store the thread target as a local function
+        variable (not via self.writer_worker) so pre-patching has no effect.
+        In that case we replace the last thread in sdk.thread_list now.
+
+        Race-safety: we wait up to 200ms for the old thread to finish its
+        initialisation before checking; if still alive we replace it and
+        start our version.  The old thread naturally exits because we drain
+        writer_queue for it (it will get queue.Empty and stop_event will be
+        set by sdk.close() eventually).
+        """
+        thread_list = getattr(self.sdk, 'thread_list', [])
+        if not thread_list:
+            logger.debug("[DittoStreamAdapter] sdk.thread_list empty — skipping fallback patch")
+            return
+
+        last_thread = thread_list[-1]
+
+        # Check if our function is already the target (pre-patch succeeded)
+        target_fn = getattr(last_thread, '_target', None)
+        if target_fn is self._patched_fn:
+            logger.debug("[DittoStreamAdapter] Pre-patch confirmed active — no fallback needed")
+            return
+
+        logger.info(
+            "[DittoStreamAdapter] Pre-patch not active in writer thread "
+            "— applying post-setup thread replacement"
+        )
+
+        # Give the old thread a moment to start (so we know it's alive)
+        last_thread.join(timeout=0.2)
+
+        if not last_thread.is_alive():
+            # Old thread already finished (very fast SDK) — just start ours
+            new_thread = threading.Thread(
+                target=self._patched_fn, daemon=True,
+                name="ditto_writer_patched"
+            )
+            thread_list[-1] = new_thread
+            new_thread.start()
+            logger.info("[DittoStreamAdapter] Fallback writer thread started (old already done)")
+            return
+
+        # Old thread still running: replace it.
+        # The old thread will also put a sentinel into frame_queue when it
+        # exits — we absorb that in iter_frames() by checking _SENTINEL type.
+        new_thread = threading.Thread(
+            target=self._patched_fn, daemon=True,
+            name="ditto_writer_patched"
+        )
+        thread_list[-1] = new_thread
+        new_thread.start()
+        logger.info("[DittoStreamAdapter] Fallback writer thread started (replacing active writer)")
 
     # ------------------------------------------------------------------
     # Feature input
@@ -331,16 +411,39 @@ class DittoStreamAdapter:
     def iter_frames(self) -> Iterator[bytes]:
         """
         Blocking generator that yields JPEG-encoded frame bytes.
-        Stops when the SDK signals end-of-stream.
+        Stops when the SDK signals end-of-stream (SENTINEL).
+
+        If both the old writer thread and our replacement thread are running
+        simultaneously (fallback scenario), up to two SENTINELs may arrive.
+        We drain all SENTINELs so the queue is clean for the next session.
 
         Designed to run in ``asyncio.to_thread()``.
         """
         if not self._is_setup:
             raise RuntimeError("Call setup() before iter_frames().")
 
+        sentinels_seen = 0
+
         while True:
             item = self._frame_queue.get()
             if item is _SENTINEL:
+                sentinels_seen += 1
+                # Drain any extra sentinels that may be enqueued already
+                # (can happen when both old thread and new thread both put one)
+                while True:
+                    try:
+                        extra = self._frame_queue.get_nowait()
+                        if extra is _SENTINEL:
+                            sentinels_seen += 1
+                        else:
+                            # Real frame that arrived just before the 2nd sentinel
+                            yield extra
+                    except queue.Empty:
+                        break
+                logger.debug(
+                    f"[DittoStreamAdapter] iter_frames done "
+                    f"({sentinels_seen} sentinel(s) received)"
+                )
                 break
             yield item   # JPEG bytes
 
